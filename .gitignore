@@ -1,0 +1,44 @@
+# Environments
+.env
+.env.local
+.env.*.local
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Accounts & Private Credentials (CRITICAL - DO NOT PUSH)
+data/accounts.json
+data/outlook_email_blacklist.json
+data/*.json
+outlook_accounts.txt
+*.txt
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# Keep sample templates and gitkeep
+!data/.gitkeep
+!.env.example
+!requirements.txt
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
