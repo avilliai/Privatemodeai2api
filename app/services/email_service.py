@@ -192,7 +192,7 @@ class OutlookEmailService:
         return account
 
     async def _access_token(self, account: OutlookAccount) -> str:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
             response = await client.post(
                 self.settings.OUTLOOK_TOKEN_URL,
                 data={
