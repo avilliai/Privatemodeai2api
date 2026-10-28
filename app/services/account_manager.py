@@ -31,7 +31,8 @@ class AccountRecord:
     completion_tokens: int = 0
     total_tokens: int = 0
     effective_tokens_used: int = 0
-    initial_quota: int = 5_000_000
+    monthly_limit: int = 1_000_000
+    daily_token_usage: dict[str, int] = field(default_factory=dict)  # YYYY-MM-DD -> tokens
     created_at: float = field(default_factory=time.time)
     last_used_at: float = 0.0
     rate_limited_until: float = 0.0
@@ -190,9 +191,19 @@ class AccountManager:
             account.consecutive_failures = 0
             if account.status == "rate_limited":
                 account.status = "active"
-            if account.effective_tokens_used >= getattr(account, "initial_quota", 5_000_000):
-                if self.settings.AUTO_DISABLE_EXHAUSTED:
-                    account.status = "exhausted"
+
+            # Record daily token stats (today & recent 7 days)
+            today_str = time.strftime("%Y-%m-%d")
+            if not hasattr(account, "daily_token_usage") or not isinstance(account.daily_token_usage, dict):
+                account.daily_token_usage = {}
+            account.daily_token_usage[today_str] = account.daily_token_usage.get(today_str, 0) + (prompt_tokens + completion_tokens)
+
+            # Purge entries older than 30 days to avoid unbounded growth
+            cutoff_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 30 * 86400))
+            account.daily_token_usage = {k: v for k, v in account.daily_token_usage.items() if k >= cutoff_day}
+
+            # NOTE: We do NOT judge exhaustion locally. Upstream Privatemode API will return 429/quota error
+            # when actual upstream monthly quota is depleted, which is handled cleanly via mark_failure.
             self.save_accounts()
 
     async def mark_failure(self, account: AccountRecord, error_type: str = "transient", detail: str = "") -> None:
@@ -239,7 +250,8 @@ class AccountManager:
                     "completion_tokens": getattr(acc, "completion_tokens", 0),
                     "total_tokens": getattr(acc, "total_tokens", 0),
                     "effective_tokens_used": getattr(acc, "effective_tokens_used", 0),
-                    "initial_quota": getattr(acc, "initial_quota", 5_000_000),
+                    "monthly_limit": getattr(acc, "monthly_limit", 1_000_000),
+                    "daily_token_usage": getattr(acc, "daily_token_usage", {}),
                     "created_at": acc.created_at,
                     "last_used_at": acc.last_used_at,
                 }

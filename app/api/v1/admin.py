@@ -41,13 +41,22 @@ async def get_accounts_detail(
         is_alive = (status_val == "active")
         disabled = (status_val == "disabled")
         
-        # Token metrics per Privatemode Free Tier: 5,000,000 initial token quota
-        initial_quota = acc.get("initial_quota", 5_000_000)
-        effective_used = acc.get("effective_tokens_used", 0)
+        # Monthly limit per Privatemode Free Tier: 1,000,000 tokens/month
+        monthly_limit = acc.get("monthly_limit", 1_000_000)
+        daily_usage = acc.get("daily_token_usage") or {}
+        
+        # Calculate today tokens & recent 7 days tokens
+        today_key = time.strftime("%Y-%m-%d")
+        today_tokens = daily_usage.get(today_key, 0)
+        
+        # Last 7 days tokens
+        seven_days_ago_key = time.strftime("%Y-%m-%d", time.localtime(time.time() - 7 * 86400))
+        last_7d_tokens = sum(v for k, v in daily_usage.items() if k >= seven_days_ago_key)
+
+        req_count = acc.get("total_requests", 0)
         total_tokens = acc.get("total_tokens", 0)
         prompt_tokens = acc.get("prompt_tokens", 0)
         completion_tokens = acc.get("completion_tokens", 0)
-        req_count = acc.get("total_requests", 0)
 
         ui_accounts.append({
             "id": email,
@@ -59,10 +68,10 @@ async def get_accounts_detail(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "effective_tokens_used": effective_used,
-            "initial_quota": initial_quota,
-            "today_usage": effective_used,
-            "daily_limit": initial_quota,
+            "today_tokens": today_tokens,
+            "last_7d_tokens": last_7d_tokens,
+            "monthly_limit": monthly_limit,
+            "daily_token_usage": daily_usage,
             "last_checked": acc.get("last_used_at") or time.time(),
             "error": f"失败重试 {acc.get('consecutive_failures', 0)}" if acc.get("consecutive_failures", 0) > 0 else None,
             "api_key_masked": acc.get("api_key_masked", "***"),

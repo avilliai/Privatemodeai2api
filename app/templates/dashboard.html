@@ -697,12 +697,12 @@
 
         <div class="metric-card">
           <div class="metric-header">
-            <span>今日配额消耗</span>
+            <span>今日 Token 消耗</span>
             <span>⚡</span>
           </div>
-          <div class="metric-value" id="stat-today-usage" style="color: var(--mocha-primary);">-</div>
+          <div class="metric-value" id="stat-today-tokens" style="color: var(--mocha-primary); font-size: 24px;">-</div>
           <div class="metric-sub">
-            <span>每日重置配额上限</span>
+            <span>最近7天: <strong id="stat-7d-tokens">-</strong> Tokens</span>
           </div>
         </div>
 
@@ -741,7 +741,7 @@
             <tr>
               <th style="width: 240px;">账号 / 邮箱</th>
               <th style="width: 120px;">运行状态</th>
-              <th style="width: 240px;">初始Token配额 / 累计消耗 (Free 500万)</th>
+              <th style="width: 260px;">今日消耗 / 7天消耗 (每月100万上限)</th>
               <th style="width: 180px;">保活与预热状态</th>
               <th style="width: 140px; text-align: right;">资产治理</th>
             </tr>
@@ -1415,12 +1415,24 @@ for chunk in response:
         document.getElementById('stat-alive-accounts').innerText = alive;
         document.getElementById('stat-alive-ratio').innerText = total > 0 ? `${Math.round((alive / total) * 100)}%` : '0%';
 
-        // 计算今日总调用量
-        let totalTodayUsage = 0;
+        // 计算今日与最近7天总 Token 消耗
+        let totalTodayTokens = 0;
+        let total7dTokens = 0;
         accountsData.forEach(a => {
-          totalTodayUsage += (a.today_usage || a.request_count || 0);
+          totalTodayTokens += (a.today_tokens || 0);
+          total7dTokens += (a.last_7d_tokens || 0);
         });
-        document.getElementById('stat-today-usage').innerText = totalTodayUsage;
+
+        const fmtTok = (num) => {
+          if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+          if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
+          return Number(num).toLocaleString();
+        };
+
+        const todayEl = document.getElementById('stat-today-tokens');
+        if (todayEl) todayEl.innerText = fmtTok(totalTodayTokens);
+        const sevenEl = document.getElementById('stat-7d-tokens');
+        if (sevenEl) sevenEl.innerText = fmtTok(total7dTokens);
 
         // 更新过滤胶囊计数
         document.getElementById('filter-count-all').innerText = total;
@@ -1502,17 +1514,17 @@ for chunk in response:
           statusBadge = '<span class="badge badge-danger">🔴 异常失效</span>';
         }
 
-        // Privatemode 官方配额 (新注册赠送 5,000,000 tokens 初始额度)
-        const initialQuota = Number(acc.initial_quota || 5000000);
-        const effTokens = Number(acc.effective_tokens_used || 0);
+        // Token 统计与官方月度上限显示
+        const todayTok = Number(acc.today_tokens || 0);
+        const sevenDayTok = Number(acc.last_7d_tokens || 0);
+        const monthlyLimit = Number(acc.monthly_limit || 1000000);
         const reqCount = Number(acc.total_requests || acc.request_count || 0);
-        const pct = Math.min(100, Math.round((effTokens / initialQuota) * 100));
 
-        // 格式化 Token 数量
+        // 格式化 Token 数量显示
         const formatTokens = (num) => {
           if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
           if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
-          return num.toLocaleString();
+          return Number(num).toLocaleString();
         };
 
         // 预热/保活时间
@@ -1522,19 +1534,17 @@ for chunk in response:
           <tr>
             <td>
               <div style="font-weight: 700; color: var(--mocha-dark); font-family: var(--font-mono);">${escapeHtml(emailStr)}</div>
-              <div style="font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono);">ID: ${escapeHtml(shortId)} | 请求: ${reqCount}次</div>
+              <div style="font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono);">ID: ${escapeHtml(shortId)} | 已调用: ${reqCount}次</div>
             </td>
             <td>${statusBadge}</td>
             <td>
-              <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 3px;">
-                <span>消耗: <strong>${formatTokens(effTokens)}</strong> / ${formatTokens(initialQuota)}</span>
-                <span style="color: var(--text-tertiary);">${pct}%</span>
+              <div style="font-size: 12px; margin-bottom: 2px; color: var(--text-primary);">
+                <span>今日: <strong>${formatTokens(todayTok)}</strong></span>
+                <span style="color: var(--text-tertiary); margin: 0 4px;">|</span>
+                <span>近7天: <strong>${formatTokens(sevenDayTok)}</strong></span>
               </div>
-              <div class="progress-bar-wrap" title="已消耗 ${effTokens.toLocaleString()} / 5,000,000 Tokens (含模型倍率)">
-                <div class="progress-bar-fill" style="width: ${pct}%; background: ${pct > 80 ? 'var(--rose-primary)' : 'var(--mocha-primary)'};"></div>
-              </div>
-              <div style="font-size: 10px; color: var(--text-tertiary); margin-top: 2px;">
-                剩余: ${(initialQuota - effTokens).toLocaleString()} Tokens
+              <div style="font-size: 11px; color: var(--text-tertiary); margin-top: 3px;">
+                每月上限: ${formatTokens(monthlyLimit)} (官方每月自动刷新，不做本地拦截)
               </div>
             </td>
             <td>
