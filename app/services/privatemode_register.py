@@ -330,14 +330,14 @@ class RegisterService:
         self._log_job(job_id, f"🚀 启动批量注册任务，目标数量: {count} 个账号")
 
         concurrency = max(1, min(concurrency, 10))
-        job["concurrency"] = concurrency
+        self.jobs[job_id]["concurrency"] = concurrency
         task = asyncio.create_task(self._run_job(job_id, count, concurrency))
         self.tasks[job_id] = task
         return job_id
 
     async def _run_job(self, job_id: str, count: int, concurrency: int = 1) -> None:
         job = self.jobs[job_id]
-        job["concurrency"] = concurrency
+        self.jobs[job_id]["concurrency"] = concurrency
         sem = asyncio.Semaphore(concurrency)
         counter_lock = asyncio.Lock()
         completed_count = 0
