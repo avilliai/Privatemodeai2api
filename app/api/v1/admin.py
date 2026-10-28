@@ -110,7 +110,7 @@ async def batch_register_outlook(
         email_svc = register_service.email_service
         count = max(1, len(email_svc._accounts) - len(email_svc._blacklist))
 
-    job_id = register_service.start_background_job(count=count)
+    job_id = register_service.start_background_job(count=count, concurrency=payload.concurrency)
     return {
         "job_id": job_id,
         "status": "running",
@@ -148,6 +148,8 @@ async def get_register_outlook_status(
         "total": total,
         "success_count": succeeded,
         "failed_count": failed,
+        "concurrency": latest_job.get("concurrency", 1),
+        "job": latest_job,
         "recent_logs": latest_job.get("logs", []),
     }
 

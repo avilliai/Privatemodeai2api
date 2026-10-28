@@ -17,6 +17,7 @@ router = APIRouter()
 
 class RegisterRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=50, description="Number of accounts to register")
+    concurrency: int = Field(default=1, ge=1, le=10, description="Concurrency level for batch registration")
     background: bool = Field(default=True, description="Run registration as a background job")
 
 
@@ -50,7 +51,7 @@ async def register_accounts(
     If background=False, waits for completion and returns created accounts.
     """
     if req.background:
-        job_id = register_service.start_background_job(count=req.count)
+        job_id = register_service.start_background_job(count=req.count, concurrency=req.concurrency)
         return {
             "job_id": job_id,
             "status": "running",

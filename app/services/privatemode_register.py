@@ -78,7 +78,7 @@ class RegisterService:
                 "message": message,
             })
 
-    async def register_single_account(self, job_id: Optional[str] = None, max_retries: int = 5) -> AccountRecord:
+    async def register_single_account(self, job_id: Optional[str] = None, max_retries: int = 15) -> AccountRecord:
         """Execute one full account registration flow and create its API key.
         Automatically retries with the next Outlook account if an email is already taken.
         """
@@ -312,7 +312,7 @@ class RegisterService:
         )
         return record
 
-    def start_background_job(self, count: int = 1) -> str:
+    def start_background_job(self, count: int = 1, concurrency: int = 1) -> str:
         """Start background registration job for `count` accounts."""
         job_id = str(uuid.uuid4())
         self.jobs[job_id] = {
@@ -329,36 +329,52 @@ class RegisterService:
         }
         self._log_job(job_id, f"🚀 启动批量注册任务，目标数量: {count} 个账号")
 
-        task = asyncio.create_task(self._run_job(job_id, count))
+        concurrency = max(1, min(concurrency, 10))
+        job["concurrency"] = concurrency
+        task = asyncio.create_task(self._run_job(job_id, count, concurrency))
         self.tasks[job_id] = task
         return job_id
 
-    async def _run_job(self, job_id: str, count: int) -> None:
+    async def _run_job(self, job_id: str, count: int, concurrency: int = 1) -> None:
         job = self.jobs[job_id]
-        for idx in range(count):
-            self._log_job(job_id, f"--- 正在处理第 [{idx + 1}/{count}] 个账号 ---")
-            try:
-                acc = await self.register_single_account(job_id=job_id)
-                job["succeeded"] += 1
-                job["created_accounts"].append({
-                    "email": acc.email,
-                    "api_key_masked": acc.api_key[:8] + "..." + acc.api_key[-4:] if len(acc.api_key) > 12 else "***",
-                    "status": acc.status,
-                })
-                self._log_job(job_id, f"✅ 第 [{idx + 1}/{count}] 个账号 {acc.email} 注册成功并存入账号池！")
-            except Exception as e:
-                logger.error("Job %s account %d/%d failed: %s", job_id, idx + 1, count, e)
-                job["failed"] += 1
-                job["errors"].append(str(e))
-                self._log_job(job_id, f"❌ 第 [{idx + 1}/{count}] 个账号注册失败: {e}", level="error")
+        job["concurrency"] = concurrency
+        sem = asyncio.Semaphore(concurrency)
+        counter_lock = asyncio.Lock()
+        completed_count = 0
 
-            # Small delay between multiple registrations to avoid Cloudflare rate limiting
-            if idx + 1 < count:
-                await asyncio.sleep(2)
+        async def worker(worker_idx: int):
+            nonlocal completed_count
+            async with sem:
+                self._log_job(job_id, f"--- [Worker #{worker_idx + 1}] 开始处理账号注册任务 ---")
+                try:
+                    acc = await self.register_single_account(job_id=job_id)
+                    async with counter_lock:
+                        completed_count += 1
+                        job["succeeded"] += 1
+                        job["created_accounts"].append({
+                            "email": acc.email,
+                            "api_key_masked": acc.api_key[:8] + "..." + acc.api_key[-4:] if len(acc.api_key) > 12 else "***",
+                            "status": acc.status,
+                        })
+                        cur_done = completed_count
+                    self._log_job(job_id, f"✅ [进度 {cur_done}/{count}] 账号 {acc.email} 注册成功并存入账号池！")
+                except Exception as e:
+                    logger.error("Job %s worker %d failed: %s", job_id, worker_idx + 1, e)
+                    async with counter_lock:
+                        completed_count += 1
+                        job["failed"] += 1
+                        job["errors"].append(str(e))
+                        cur_done = completed_count
+                    self._log_job(job_id, f"❌ [进度 {cur_done}/{count}] 账号注册失败: {e}", level="error")
+
+                await asyncio.sleep(1)
+
+        tasks = [asyncio.create_task(worker(i)) for i in range(count)]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
         job["status"] = "completed" if job["failed"] == 0 else ("partial" if job["succeeded"] > 0 else "failed")
         job["finished_at"] = time.time()
-        self._log_job(job_id, f"🏁 批量注册任务执行完毕: 目标 {count} 个, 成功 {job['succeeded']} 个, 失败 {job['failed']} 个")
+        self._log_job(job_id, f"🏁 批量注册任务执行完毕: 目标 {count} 个, 成功 {job['succeeded']} 个, 失败 {job['failed']} 个 (并发数: {concurrency})")
 
     async def recover_single_account(self, email: str, job_id: Optional[str] = None) -> AccountRecord:
         """Recover an already-registered Privatemode account via Clerk sign-in & IMAP OTP."""
@@ -367,7 +383,7 @@ class RegisterService:
         if not inbox:
             raise RegistrationError(f"Email {email} not found in Outlook account file")
 
-        self._log_job(job_id, f"[{email}] 歧在找固已注化户户，请求 Turnstile Solver 求觠人溸验证...")
+        self._log_job(job_id, f"[{email}] 正在找回已注册账号，请求 Turnstile Solver 求解人机验证...")
         captcha_token = await self.turnstile_service.solve(
             url="https://portal.privatemode.ai/",
             sitekey=self.settings.TURNSTILE_SITEKEY,
@@ -384,7 +400,7 @@ class RegisterService:
 
         async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True) as client:
             # 1. Clerk sign_in
-            self._log_job(job_id, f"[{email}] 发起 Clerk 盻录流程...")
+            self._log_job(job_id, f"[{email}] 发起 Clerk 登录流程...")
             res = await client.post(
                 f"{clerk_base}/client/sign_ins?_clerk_js_version=5",
                 data={"identifier": email, "captcha_token": captcha_token},
@@ -400,7 +416,7 @@ class RegisterService:
                 raise RegistrationError(f"Clerk sign_in missing email_code factor or ID: {resp_data}")
 
             # 2. Prepare email code factor
-            self._log_job(job_id, f"[{email}] 准分发送 Outlook 邮箱盻录验证码...")
+            self._log_job(job_id, f"[{email}] 准备发送 Outlook 邮箱登录验证码...")
             res = await client.post(
                 f"{clerk_base}/client/sign_ins/{sia_id}/prepare_first_factor?_clerk_js_version=5",
                 data={"strategy": "email_code", "email_address_id": email_factor["email_address_id"]},
@@ -409,12 +425,12 @@ class RegisterService:
                 raise RegistrationError(f"Prepare first factor failed: HTTP {res.status_code} {res.text[:200]}")
 
             # 3. Wait for email code via IMAP
-            self._log_job(job_id, f"[{email}] 正在盔T 0Outlook IMAP 邮箱获取验证码...")
+            self._log_job(job_id, f"[{email}] 正在从 Outlook IMAP 邮箱获取验证码...")
             code = await self.email_service.wait_for_code(inbox)
             self._log_job(job_id, f"[{email}] 成功截获 6 位登录验证码: {code}")
 
             # 4. Attempt first factor
-            self._log_job(job_id, f"[{email}] 正在提交验证码栨验...")
+            self._log_job(job_id, f"[{email}] 正在提交验证码校验...")
             res = await client.post(
                 f"{clerk_base}/client/sign_ins/{sia_id}/attempt_first_factor?_clerk_js_version=5",
                 data={"strategy": "email_code", "code": code},
@@ -457,7 +473,7 @@ class RegisterService:
                 org_id = org_data.get("id")
 
             # 6. Fetch org-scoped JWT token
-            self._log_job(job_id, f"[{email}] ?? Organization ?? JWT Token...")
+            self._log_job(job_id, f"[{email}] 正在获取 Organization 作用域 JWT Token...")
             res = await client.post(
                 f"{clerk_base}/client/sessions/{session_id}/tokens?organization_id={org_id}&_clerk_js_version=5",
                 data={},
@@ -504,7 +520,7 @@ class RegisterService:
 
             # If no existing license key found or readable, create a fresh one
             if not license_key:
-                self._log_job(job_id, f"[{email}] 正在创建公新的 License API Key...")
+                self._log_job(job_id, f"[{email}] 正在创建全新的 License API Key...")
                 exp_year = datetime.now(timezone.utc).year + 2
                 res = await saas_client.post(
                     f"{saas_base}/api/v3/keys",
@@ -569,7 +585,7 @@ class RegisterService:
         job = self.jobs[job_id]
         total = len(emails)
         for idx, email in enumerate(emails):
-            self._log_job(job_id, f"--- 开始戾回第 [{idx + 1}/{total}] 个账号: {email} ---")
+            self._log_job(job_id, f"--- 开始找回第 [{idx + 1}/{total}] 个账号: {email} ---")
             try:
                 acc = await self.recover_single_account(email, job_id=job_id)
                 job["succeeded"] += 1
@@ -578,12 +594,12 @@ class RegisterService:
                     "api_key_masked": acc.api_key[:8] + "..." + acc.api_key[-4:] if len(acc.api_key) > 12 else "***",
                     "status": acc.status,
                 })
-                self._log_job(job_id, f"✅ 账号 {email} 成功找固年已楼入活胏号池")
+                self._log_job(job_id, f"✅ 账号 {email} 成功找回并已存入活跃号池")
             except Exception as e:
                 logger.error("Recovery job %s for %s failed: %s", job_id, email, e)
                 job["failed"] += 1
                 job["errors"].append(f"{email}: {e}")
-                self._log_job(job_id, f"❌ 账号 {email} 找回失謥: {e}", level="error")
+                self._log_job(job_id, f"❌ 账号 {email} 找回失败: {e}", level="error")
 
             if idx + 1 < total:
                 await asyncio.sleep(2)
