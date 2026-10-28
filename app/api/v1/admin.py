@@ -158,15 +158,29 @@ async def get_register_outlook_status(
 async def cancel_register_job(
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Cancel any running background registration task."""
+    """Cancel any running background registration task or clean up hung jobs."""
     cancelled = 0
     for jid, task in list(register_service.tasks.items()):
         if not task.done():
             task.cancel()
             cancelled += 1
-            if jid in register_service.jobs:
-                register_service.jobs[jid]["status"] = "cancelled"
-                register_service.jobs[jid]["logs"].append("[CANCEL] 任务已被管理员手动终止")
+        if jid in register_service.jobs:
+            register_service.jobs[jid]["status"] = "cancelled"
+            register_service.jobs[jid]["logs"].append({
+                "time": __import__("time").strftime("%H:%M:%S"),
+                "level": "warning",
+                "message": "[CANCEL] 任务已被管理员手动终止",
+            })
+    # Also mark any lingering running jobs without active tasks as cancelled
+    for jid, j in register_service.jobs.items():
+        if j.get("status") == "running":
+            j["status"] = "cancelled"
+            j["logs"].append({
+                "time": __import__("time").strftime("%H:%M:%S"),
+                "level": "warning",
+                "message": "[CANCEL] 任务已清理终止",
+            })
+            cancelled += 1
     return {"message": f"Cancelled {cancelled} active background task(s)"}
 
 
