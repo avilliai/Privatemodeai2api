@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.api.v1.admin import router as admin_router
 from app.api.v1.chat import router as chat_router
+from app.api.v1.embeddings import router as embeddings_router
 from app.api.v1.models import router as models_router
 from app.api.v1.register import router as register_router
 from app.core.config import settings
@@ -48,6 +49,17 @@ async def lifespan(app: FastAPI):
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
     root_logger.addHandler(handler)
     stats = await account_manager.get_stats()
+    # Sync already registered accounts from accounts.json to Outlook blacklist to prevent duplicate attempts
+    try:
+        from app.core.dependencies import register_service
+        registered_emails = {acc.email for acc in account_manager.accounts}
+        if registered_emails:
+            added = await register_service.email_service.blacklist_registered(registered_emails)
+            if added:
+                logger.info("Auto-synced %d registered accounts into Outlook blacklist", added)
+    except Exception as exc:
+        logger.warning("Failed to auto-sync registered accounts to blacklist: %s", exc)
+
     logger.info(
         "Privatemode2API started on %s:%d | Total accounts: %d (Active: %d, Exhausted: %d)",
         settings.HOST,
@@ -122,6 +134,7 @@ def create_app() -> FastAPI:
 
     # Include API routers under /v1 prefix
     app.include_router(chat_router, prefix="/v1", tags=["Chat"])
+    app.include_router(embeddings_router, prefix="/v1", tags=["Embeddings"])
     app.include_router(models_router, prefix="/v1", tags=["Models"])
     app.include_router(register_router, prefix="/v1", tags=["Registration"])
     app.include_router(admin_router, prefix="/v1", tags=["Admin"])
@@ -129,6 +142,7 @@ def create_app() -> FastAPI:
 
     # Also route chat and models at root level for clients omitting /v1
     app.include_router(chat_router, tags=["Chat (Root)"])
+    app.include_router(embeddings_router, tags=["Embeddings (Root)"])
     app.include_router(models_router, tags=["Models (Root)"])
 
     @app.get("/health", tags=["Health"])

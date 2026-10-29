@@ -1,9 +1,12 @@
-﻿"""Admin and Account Pool management router with full dashboard compatibility."""
-
 from __future__ import annotations
+from app.core.exceptions import OutlookImapAuthenticationError
+"""Admin and Account Pool management router with full dashboard compatibility."""
+
 
 import logging
 import time
+import asyncio
+import httpx
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, status, Header
@@ -188,17 +191,33 @@ async def cancel_register_job(
 async def probe_all_accounts(
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Check connectivity / validity of all accounts in the pool."""
-    accounts = await account_manager.list_accounts()
-    alive_count = 0
-    now = time.time()
-    for acc in accounts:
-        if acc.get("status") == "active":
-            alive_count += 1
+    """Check connectivity / validity of all accounts in the pool by querying upstream."""
+    acc_objs = list(account_manager.accounts)
+    sem = asyncio.Semaphore(15)
+    url = f"{settings.PRIVATEMODE_PROXYLESS_URL}/models"
+
+    async def _probe(acc):
+        async with sem:
+            try:
+                async with httpx.AsyncClient(timeout=6.0) as client:
+                    resp = await client.get(url, headers={"Authorization": f"Bearer {acc.api_key}"})
+                    if resp.status_code == 200:
+                        acc.status = "active"
+                        acc.consecutive_failures = 0
+                        return True
+                    else:
+                        acc.status = "auth_failed"
+                        return False
+            except Exception:
+                return False
+
+    results = await asyncio.gather(*[_probe(a) for a in acc_objs])
+    alive_count = sum(1 for r in results if r)
+    account_manager.save_accounts()
     return {
         "status": "ok",
         "alive_count": alive_count,
-        "total_count": len(accounts),
+        "total_count": len(acc_objs),
     }
 
 
@@ -207,18 +226,115 @@ async def probe_single_account(
     acc_id: str,
     _auth: str | None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Probe a single account's license key and status."""
+    """Probe a single account license key against upstream /models."""
     acc = await account_manager.get_account_by_email(acc_id)
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
-    now = time.time()
-    is_alive = acc.is_usable(now)
+
+    url = f"{settings.PRIVATEMODE_PROXYLESS_URL}/models"
+    headers = {"Authorization": f"Bearer {acc.api_key}"}
+    is_alive = False
+    status_code = 0
+    message = ""
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, headers=headers)
+            status_code = resp.status_code
+            if resp.status_code == 200:
+                is_alive = True
+                acc.status = "active"
+                acc.consecutive_failures = 0
+                message = "Upstream valid (200 OK)"
+            elif resp.status_code == 401:
+                acc.status = "auth_failed"
+                message = "Upstream invalid (401 Unauthorized)"
+            else:
+                message = f"Upstream HTTP {resp.status_code}"
+    except Exception as e:
+        message = f"Probe error: {str(e)}"
+
+    account_manager.save_accounts()
     return {
         "id": acc_id,
-        "status": "active" if is_alive else acc.status,
+        "status": "ok",
         "is_alive": is_alive,
-        "message": "Account operational" if is_alive else "Account unavailable",
+        "upstream_status": status_code,
+        "message": message,
     }
+
+
+
+class BatchRecoverRequest(BaseModel):
+    concurrency: int = Field(default=3, ge=1, le=10, description="并发恢复线程数")
+    only_unrecovered: bool = Field(default=True, description="仅恢复未标记recovered或失效的账号")
+
+@router.post("/admin/accounts/batch-recover")
+async def batch_recover_accounts(
+    req: BatchRecoverRequest = BatchRecoverRequest(),
+    _auth: str | None = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Trigger background batch recovery for accounts in the pool with concurrency."""
+    acc_objs = list(account_manager.accounts)
+    target_emails = []
+    for acc in acc_objs:
+        if req.only_unrecovered:
+            is_rec = acc.metadata.get("recovered", False)
+            if is_rec and acc.status == "active" and acc.consecutive_failures == 0:
+                continue
+        if acc.status != "disabled":
+            target_emails.append(acc.email)
+
+    if not target_emails:
+        return {
+            "status": "ok",
+            "message": "当前号池中没有需要恢复的账号 (全部已恢复或已被禁用)",
+            "total_targets": 0,
+            "job_id": None
+        }
+
+    job_id = register_service.start_recovery_job(emails=target_emails, concurrency=req.concurrency)
+    return {
+        "status": "ok",
+        "message": f"已启动并发恢复任务，目标账号数: {len(target_emails)}，并发数: {req.concurrency}",
+        "total_targets": len(target_emails),
+        "job_id": job_id
+    }
+
+@router.post("/admin/accounts/{acc_id}/recover")
+async def recover_single_account(
+    acc_id: str,
+    _auth: str | None = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Trigger recovery for a single account."""
+    acc = await account_manager.get_account_by_email(acc_id)
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    try:
+        success = await register_service.recover_single_account(acc.email)
+        return {"status": "ok", "message": f"Account {acc_id} recovered successfully"}
+    except OutlookImapAuthenticationError as e:
+        acc.disabled = True
+        acc.status = "disabled"
+        acc.error = f"Outlook IMAP 失效 ({str(e)[:80]})"
+        await account_manager.save_accounts()
+        return {
+            "status": "error",
+            "message": f"Outlook 邮箱已失效 (User is authenticated but not connected)，已自动将该账号标记为【禁用】: {e}"
+        }
+    except Exception as e:
+        err_str = str(e)
+        if "User is authenticated but not connected" in err_str:
+            acc.disabled = True
+            acc.status = "disabled"
+            acc.error = "Outlook IMAP 失效 (User is authenticated but not connected)"
+            await account_manager.save_accounts()
+            return {
+                "status": "error",
+                "message": f"Outlook 邮箱已失效，已自动标记为【禁用】: {err_str}"
+            }
+        return {"status": "error", "message": f"Account {acc_id} recovery failed: {e}"}
 
 
 @router.post("/admin/accounts/{acc_id}/toggle")

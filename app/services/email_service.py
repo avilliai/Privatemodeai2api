@@ -160,27 +160,36 @@ class OutlookEmailService:
         if not self._accounts:
             self.reload_accounts()
 
-        async with self._lock:
-            while self._next_account < len(self._accounts):
-                index = self._next_account
-                self._next_account += 1
-                account = self._accounts[index]
-                addr = account.address.strip().lower()
-                if addr in self._blacklist:
-                    continue
-                try:
-                    await self._access_token(account)
-                    return EmailInbox(
-                        address=account.address,
-                        token=str(index),
-                        created_at=time.time(),
-                    )
-                except Exception as exc:
-                    logger.warning("Outlook account %s invalid/unusable: %s, skipping...", addr, exc)
-                    continue
-            raise RegistrationError(
-                "Outlook account pool is exhausted (all available accounts were skipped or blacklisted)"
-            )
+        while True:
+            account = None
+            index = -1
+            async with self._lock:
+                while self._next_account < len(self._accounts):
+                    idx = self._next_account
+                    self._next_account += 1
+                    acc = self._accounts[idx]
+                    addr = acc.address.strip().lower()
+                    if addr not in self._blacklist:
+                        account = acc
+                        index = idx
+                        break
+
+            if account is None:
+                raise RegistrationError(
+                    "Outlook account pool is exhausted (all available accounts were skipped or blacklisted)"
+                )
+
+            addr = account.address.strip().lower()
+            try:
+                await self._access_token(account)
+                return EmailInbox(
+                    address=account.address,
+                    token=str(index),
+                    created_at=time.time(),
+                )
+            except Exception as exc:
+                logger.warning("Outlook account %s invalid/unusable: %s, skipping...", addr, exc)
+                continue
 
     def _account(self, inbox: EmailInbox) -> OutlookAccount:
         try:
@@ -296,6 +305,9 @@ class OutlookEmailService:
         while asyncio.get_running_loop().time() < deadline:
             try:
                 messages = await self.fetch_messages(inbox)
+            except OutlookImapAuthenticationError as e:
+                logger.error("Outlook IMAP auth permanently rejected for %s: %s", inbox.address, e)
+                raise
             except Exception as e:
                 logger.warning("Error fetching emails for %s: %s", inbox.address, e)
                 messages = []

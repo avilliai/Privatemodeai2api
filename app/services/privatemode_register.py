@@ -15,7 +15,7 @@ from typing import Any, Optional
 import httpx
 
 from app.core.config import Settings, settings as app_settings
-from app.core.exceptions import RegistrationError, TurnstileError
+from app.core.exceptions import OutlookImapAuthenticationError,  RegistrationError, TurnstileError
 from app.services.account_manager import AccountManager, AccountRecord
 from app.services.email_service import EmailInbox, OutlookEmailService
 from app.services.turnstile_service import TurnstileService
@@ -53,6 +53,27 @@ def generate_org_name() -> str:
 
 
 class RegisterService:
+    _recovering_emails: set[str] = set()
+
+    async def trigger_background_recovery(self, email: str) -> None:
+        """Trigger non-blocking background recovery for an account that hit 401 invalid key."""
+        email_clean = email.strip()
+        if email_clean in self._recovering_emails:
+            return
+        self._recovering_emails.add(email_clean)
+
+        async def _worker():
+            try:
+                logger.info("[Auto-Recovery] 正在为失效账号 %s 在后台自动恢复并刷新 API Key...", email_clean)
+                await self.recover_single_account(email_clean)
+                logger.info("[Auto-Recovery] 账号 %s 自动恢复完成，已重新生效上线！", email_clean)
+            except Exception as e:
+                logger.warning("[Auto-Recovery] 账号 %s 自动恢复失败: %s", email_clean, e)
+            finally:
+                self._recovering_emails.discard(email_clean)
+
+        asyncio.create_task(_worker())
+
     def __init__(
         self,
         settings: Settings | None = None,
@@ -255,7 +276,7 @@ class RegisterService:
             org_jwt = res.json().get("jwt")
             if not org_jwt:
                 raise RegistrationError(f"Missing org-scoped jwt in response: {res.json()}")
-            # 9. Initialize Organization in Privatemode SaaS backend
+            # 9. Initialize & Verify Organization in Privatemode SaaS backend
         saas_base = self.settings.PRIVATEMODE_SAAS_URL.rstrip("/")
         async with httpx.AsyncClient(
             headers={
@@ -266,15 +287,26 @@ class RegisterService:
             },
             timeout=30,
         ) as saas_client:
-            self._log_job(job_id, f"[{email}] 在 Privatemode 后端初始化 Organization...")
+            self._log_job(job_id, f"[{email}] 在 Privatemode 后端激活并初始化 Organization...")
             org_payload = {
                 "industry": "software_it",
                 "developer_count": "1_20",
                 "use_cases": ["chat", "coding_assistant"],
             }
-            res = await saas_client.post(f"{saas_base}/api/v2/organizations", json=org_payload)
-            if res.status_code not in (200, 201, 204):
-                logger.warning("[%s] Org init returned HTTP %d: %s (continuing)", email, res.status_code, res.text[:200])
+            # Provision organization on SaaS backend (retry up to 3 times to guarantee persistence)
+            provisioned = False
+            for p_att in range(1, 4):
+                res = await saas_client.post(f"{saas_base}/api/v2/organizations", json=org_payload)
+                if res.status_code in (200, 201, 204):
+                    # Verify organization is recognized
+                    v_res = await saas_client.get(f"{saas_base}/api/v2/organizations")
+                    if v_res.status_code == 200:
+                        provisioned = True
+                        break
+                await asyncio.sleep(1.0)
+
+            if not provisioned:
+                raise RegistrationError(f"Failed to provision and verify organization for {email} in Privatemode SaaS")
 
             # 10. Create API key in Privatemode SaaS backend
             self._log_job(job_id, f"[{email}] 正在为该账号生成专属 API Key (共享对话配额)...")
@@ -505,7 +537,7 @@ class RegisterService:
                 },
             )
 
-            # Query existing keys
+            # Query existing keys and clean up old/masked keys
             license_key = None
             key_id = ""
             res = await saas_client.get(f"{saas_base}/api/v3/keys")
@@ -513,7 +545,13 @@ class RegisterService:
                 existing_keys = res.json()
                 if isinstance(existing_keys, list) and existing_keys:
                     for k in existing_keys:
-                        if k.get("license_key"):
+                        # Privatemode masks keys on subsequent GETs. Delete old invalid keys so we can create a working one.
+                        if not k.get("license_key") and k.get("key_id"):
+                            try:
+                                await saas_client.delete(f"{saas_base}/api/v3/keys/{k['key_id']}")
+                            except Exception:
+                                pass
+                        elif k.get("license_key"):
                             license_key = k["license_key"]
                             key_id = k.get("key_id", "")
                             break
@@ -560,8 +598,8 @@ class RegisterService:
         )
         return record
 
-    def start_recovery_job(self, emails: list[str]) -> str:
-        """Start background recovery job for specified emails."""
+    def start_recovery_job(self, emails: list[str], concurrency: int = 3) -> str:
+        """Start background recovery job for specified emails with concurrency support."""
         job_id = str(uuid.uuid4())
         self.jobs[job_id] = {
             "job_id": job_id,
@@ -575,34 +613,65 @@ class RegisterService:
             "started_at": time.time(),
             "finished_at": None,
         }
-        self._log_job(job_id, f"启动批量账号找回任务: 共 {len(emails)} 个账号")
+        self._log_job(job_id, f"启动批量账号找回任务: 共 {len(emails)} 个账号 (并发数: {concurrency})")
 
-        task = asyncio.create_task(self._run_recovery_job(job_id, emails))
+        task = asyncio.create_task(self._run_recovery_job(job_id, emails, concurrency=concurrency))
         self.tasks[job_id] = task
         return job_id
 
-    async def _run_recovery_job(self, job_id: str, emails: list[str]) -> None:
+    async def _run_recovery_job(self, job_id: str, emails: list[str], concurrency: int = 3) -> None:
         job = self.jobs[job_id]
         total = len(emails)
-        for idx, email in enumerate(emails):
-            self._log_job(job_id, f"--- 开始找回第 [{idx + 1}/{total}] 个账号: {email} ---")
-            try:
-                acc = await self.recover_single_account(email, job_id=job_id)
-                job["succeeded"] += 1
-                job["created_accounts"].append({
-                    "email": acc.email,
-                    "api_key_masked": acc.api_key[:8] + "..." + acc.api_key[-4:] if len(acc.api_key) > 12 else "***",
-                    "status": acc.status,
-                })
-                self._log_job(job_id, f"✅ 账号 {email} 成功找回并已存入活跃号池")
-            except Exception as e:
-                logger.error("Recovery job %s for %s failed: %s", job_id, email, e)
-                job["failed"] += 1
-                job["errors"].append(f"{email}: {e}")
-                self._log_job(job_id, f"❌ 账号 {email} 找回失败: {e}", level="error")
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+        lock = asyncio.Lock()
+        completed_count = 0
 
-            if idx + 1 < total:
-                await asyncio.sleep(2)
+        async def _worker(idx: int, email: str):
+            nonlocal completed_count
+            async with semaphore:
+                self._log_job(job_id, f"--- 开始恢复 [{idx + 1}/{total}]: {email} ---")
+                try:
+                    acc = await self.recover_single_account(email, job_id=job_id)
+                    async with lock:
+                        job["succeeded"] += 1
+                        job["created_accounts"].append({
+                            "email": acc.email,
+                            "api_key_masked": acc.api_key[:8] + "..." + acc.api_key[-4:] if len(acc.api_key) > 12 else "***",
+                            "status": acc.status,
+                        })
+                        completed_count += 1
+                    self._log_job(job_id, f"✅ [{completed_count}/{total}] 账号 {email} 成功找回并已签发新Key！")
+                except (OutlookImapAuthenticationError, Exception) as e:
+                    err_str = str(e)
+                    is_imap_err = isinstance(e, OutlookImapAuthenticationError) or "User is authenticated but not connected" in err_str
+                    if is_imap_err:
+                        logger.error("Recovery job %s for %s: Outlook IMAP rejected: %s", job_id, email, err_str)
+                        acc_rec = await self.account_manager.get_account_by_email(email)
+                        if acc_rec:
+                            acc_rec.disabled = True
+                            acc_rec.status = "disabled"
+                            acc_rec.error = f"Outlook IMAP已失效: {err_str[:80]}"
+                            await self.account_manager.save_accounts()
+                        async with lock:
+                            job["failed"] += 1
+                            job["errors"].append(f"{email}: Outlook邮箱已失效")
+                            completed_count += 1
+                        self._log_job(job_id, f"⛔ [{completed_count}/{total}] 账号 {email} Outlook 邮箱已不可用，已自动标记为【禁用】", level="error")
+                    else:
+                        logger.error("Recovery job %s for %s failed: %s", job_id, email, e)
+                        async with lock:
+                            job["failed"] += 1
+                            job["errors"].append(f"{email}: {e}")
+                            completed_count += 1
+                        self._log_job(job_id, f"❌ [{completed_count}/{total}] 账号 {email} 找回失败: {e}", level="error")
+
+                # 任务完成后稍作微弱间隔，错开并发请求
+                await asyncio.sleep(0.5)
+
+        # 启动所有协程
+        tasks = [_worker(i, em) for i, em in enumerate(emails)]
+        await asyncio.gather(*tasks)
 
         job["status"] = "completed" if job["failed"] == 0 else ("partial" if job["succeeded"] > 0 else "failed")
         job["finished_at"] = time.time()
+        self._log_job(job_id, f"🎉 批量找回任务结束！成功: {job['succeeded']}, 失败: {job['failed']} (总共 {total})")

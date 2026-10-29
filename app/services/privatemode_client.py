@@ -46,9 +46,22 @@ class PrivatemodeClient:
         self,
         settings: Settings | None = None,
         account_manager: AccountManager | None = None,
+        register_service: Any | None = None,
     ):
         self.settings = settings or app_settings
         self.account_manager = account_manager or AccountManager(self.settings)
+        self._register_service = register_service
+
+    
+    def _trigger_auto_recovery(self, email: str) -> None:
+        try:
+            if self._register_service is None:
+                from app.services.privatemode_register import RegisterService
+                self._register_service = RegisterService(self.settings, self.account_manager)
+            import asyncio
+            asyncio.create_task(self._register_service.trigger_background_recovery(email))
+        except Exception as exc:
+            logger.warning("Could not spawn auto recovery for %s: %s", email, exc)
 
     def resolve_model(self, requested_model: str) -> str:
         """Resolve model aliases to Privatemode supported models."""
@@ -66,12 +79,29 @@ class PrivatemodeClient:
         max_account_retries: int = 3,
     ) -> dict[str, Any]:
         """Non-streaming chat completion with automatic account failover."""
+        return await self._non_streaming(payload, "chat/completions", max_account_retries)
+
+    async def embeddings(
+        self, payload: dict[str, Any], max_account_retries: int = 3,
+    ) -> dict[str, Any]:
+        """Forward embeddings through the same account pool and usage accounting."""
+        model = payload["model"]
+        resolved = self.settings.model_aliases.get(model, model)
+        # Never silently substitute a chat model for an embedding model.
+        if resolved not in self.settings.models_list or "embedding" not in resolved:
+            raise UpstreamError("Unsupported embedding model", status_code=400)
+        return await self._non_streaming(dict(payload), "embeddings", max_account_retries)
+
+    async def _non_streaming(
+        self, payload: dict[str, Any], endpoint_path: str, max_account_retries: int,
+    ) -> dict[str, Any]:
         # Normalize model
         model = payload.get("model", self.settings.DEFAULT_MODEL)
         payload["model"] = self.resolve_model(model)
-        payload["stream"] = False
+        if endpoint_path == "chat/completions":
+            payload["stream"] = False
 
-        endpoint = f"{self.settings.PRIVATEMODE_PROXYLESS_URL.rstrip('/')}/chat/completions"
+        endpoint = f"{self.settings.PRIVATEMODE_PROXYLESS_URL.rstrip('/')}/{endpoint_path}"
 
         last_error: Exception | None = None
         for attempt in range(max_account_retries):
@@ -112,6 +142,12 @@ class PrivatemodeClient:
                 # Handle errors
                 status_code = response.status_code
                 error_body = response.text[:500]
+                if endpoint_path == "embeddings" and status_code in (400, 404, 422):
+                    # Input/route errors say nothing about account health.
+                    raise UpstreamError(
+                        f"Privatemode upstream returned HTTP {status_code}: {error_body}",
+                        status_code=status_code,
+                    )
                 logger.warning(
                     "Upstream error HTTP %d for account %s: %s",
                     status_code,
@@ -123,6 +159,8 @@ class PrivatemodeClient:
                     await self.account_manager.mark_failure(account, "rate_limit", error_body)
                 elif status_code in (401, 403):
                     await self.account_manager.mark_failure(account, "auth", error_body)
+                    if "invalid api key" in error_body.lower() or status_code == 401:
+                        self._trigger_auto_recovery(account.email)
                 elif "quota" in error_body.lower() or "balance" in error_body.lower() or "credit" in error_body.lower():
                     await self.account_manager.mark_failure(account, "quota_exceeded", error_body)
                 else:
@@ -242,6 +280,8 @@ class PrivatemodeClient:
                     await self.account_manager.mark_failure(account, "rate_limit", error_body)
                 elif status_code in (401, 403):
                     await self.account_manager.mark_failure(account, "auth", error_body)
+                    if "invalid api key" in error_body.lower() or status_code == 401:
+                        self._trigger_auto_recovery(account.email)
                 elif "quota" in error_body.lower() or "balance" in error_body.lower() or "credit" in error_body.lower():
                     await self.account_manager.mark_failure(account, "quota_exceeded", error_body)
                 else:

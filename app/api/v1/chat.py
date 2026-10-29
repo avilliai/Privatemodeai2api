@@ -46,43 +46,11 @@ async def chat_completions(
             },
         )
 
-    try:
-        result = await privatemode_client.chat_completion(body)
-        return Response(
-            content=json.dumps(result, ensure_ascii=False),
-            media_type="application/json",
-            status_code=200,
-        )
-    except AccountPoolError as pool_err:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": {
-                    "message": str(pool_err),
-                    "type": "insufficient_quota",
-                    "code": 503,
-                }
-            },
-        )
-    except UpstreamError as up_err:
-        raise HTTPException(
-            status_code=up_err.status_code or 502,
-            detail={
-                "error": {
-                    "message": str(up_err),
-                    "type": "upstream_error",
-                    "code": up_err.status_code,
-                }
-            },
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": {
-                    "message": f"Internal server error: {exc}",
-                    "type": "server_error",
-                    "code": 500,
-                }
-            },
-        )
+    # Let the application-level OpenAI error handlers format failures once.
+    # Raising HTTPException here used to produce the invalid {detail: {detail: ...}} shape.
+    result = await privatemode_client.chat_completion(body)
+    return Response(
+        content=json.dumps(result, ensure_ascii=False),
+        media_type="application/json",
+        status_code=200,
+    )

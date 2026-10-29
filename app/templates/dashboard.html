@@ -660,7 +660,7 @@
     <div class="nav-actions">
       <div class="auth-input-wrap" title="管理 API Key (自动保存至本地)">
         <span style="font-size: 11px; color: var(--text-tertiary);">KEY:</span>
-        <input type="password" id="input-api-key" placeholder="API Key" onchange="saveApiKey(this.value)" />
+        <input type="password" id="input-api-key" placeholder="网关Key(默认:endlesswork)" style="width:185px;" onchange="saveApiKey(this.value)" />
       </div>
       <button class="btn btn-secondary btn-sm" onclick="refreshCurrentTab()" title="刷新数据">🔄 刷新</button>
     </div>
@@ -731,6 +731,7 @@
           <div style="display: flex; align-items: center; gap: 10px;">
             <input type="text" class="search-input" id="account-search" placeholder="🔍 搜索邮箱或账号 ID..." oninput="handleAccountSearch(this.value)" />
             <button class="btn btn-secondary btn-sm" onclick="triggerBatchProbe()" title="对存活账号低频平滑探活">⚡ 批量探活</button>
+            <button class="btn btn-warning btn-sm" onclick="triggerBatchRecover()" title="并发自动为所有失效Key重新签发">🚀 并发恢复所有Key</button>
             <button class="btn btn-secondary btn-sm" onclick="triggerResetQuota()" title="重置今日调用配额计数">🔄 重置配额</button>
             <button class="btn btn-sm" onclick="switchTab('register')">➕ 注册新账号</button>
           </div>
@@ -1134,7 +1135,7 @@
     </div>
 
     <!-- ==================== 4. 在线交互与工具 TAB ==================== -->
-    <div class="tab-page" >
+    <div class="tab-page" id="page-chat">
       <div class="chat-container">
         <!-- 聊天顶部控制条 -->
         <div class="chat-toolbar">
@@ -1554,6 +1555,7 @@ for chunk in response:
             <td style="text-align: right;">
               <div style="display: inline-flex; gap: 6px;">
                 <button class="btn btn-secondary btn-sm" onclick="probeSingleAccount('${escapeHtml(idStr)}')" title="单独低频探活">⚡ 探活</button>
+                <button class="btn btn-warning btn-sm" onclick="recoverSingleAccount('${escapeHtml(idStr)}')" title="重新签发有效Key恢复">🔄 恢复</button>
                 <button class="btn btn-secondary btn-sm" onclick="toggleAccount('${escapeHtml(idStr)}', ${acc.disabled ? 'false' : 'true'})">
                   ${acc.disabled ? '▶ 启用' : '⏸ 停用'}
                 </button>
@@ -1584,6 +1586,27 @@ for chunk in response:
       }
     }
 
+    
+    async function recoverSingleAccount(accId) {
+      if (!confirm("确定要尝试恢复账号 [" + accId + "] 吗？\n系统将使用注册凭证向 Privatemode 重新申请签发有效 API Key。")) return;
+      try {
+        showToast("正在对账号 " + accId + " 执行恢复重签...", "info");
+        const res = await fetch("/admin/accounts/" + accId + "/recover", {
+          method: "POST",
+          headers: { "X-API-Key": apiKey, "Authorization": "Bearer " + apiKey }
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+          showToast("账号 " + accId + " 恢复成功！新Key已生效", "ok");
+        } else {
+          showToast("恢复失败: " + (data.detail || data.message || "未知原因"), "err");
+        }
+        loadAccounts();
+      } catch (err) {
+        showToast("恢复请求异常: " + err.message, "err");
+      }
+    }
+
     async function toggleAccount(accId, targetDisabled) {
       try {
         const res = await fetch(`/admin/accounts/${accId}/toggle`, {
@@ -1609,6 +1632,41 @@ for chunk in response:
         loadAccounts();
       } catch (err) {
         showToast(`删除失败: ${err.message}`, 'err');
+      }
+    }
+
+    async function triggerBatchRecover() {
+      const concurrencyStr = prompt("请输入并发恢复线程数 (建议 2-5):", "3");
+      if (!concurrencyStr) return;
+      const concurrency = parseInt(concurrencyStr, 10) || 3;
+
+      if (!confirm(`确定要启动全池并发恢复吗？\n并发数: ${concurrency}\n系统将自动跳过已恢复账号，对所有失效账号自动登录并重新签发有效 Key。`)) return;
+
+      try {
+        showToast("正在启动并发恢复任务...", "info");
+        const res = await fetch("/admin/accounts/batch-recover", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": apiKey,
+            "Authorization": "Bearer " + apiKey
+          },
+          body: JSON.stringify({ concurrency: concurrency, only_unrecovered: true })
+        });
+        const data = await res.json();
+        if (data.status === "ok" && data.job_id) {
+          showToast(`🚀 ${data.message}，已自动跳转至注册/恢复任务中心查看实时进度！`, "ok");
+          switchTab("register");
+          // 若存在任务轮询函数则触发
+          if (typeof pollRegisterStatus === "function") {
+            currentJobId = data.job_id;
+            pollRegisterStatus();
+          }
+        } else {
+          showToast(data.message || "未能启动任务", "info");
+        }
+      } catch (err) {
+        showToast("启动并发恢复异常: " + err.message, "err");
       }
     }
 
