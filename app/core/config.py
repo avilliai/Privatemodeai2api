@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     PRIVATEMODE_CLERK_PK: str = "pk_live_Y2xlcmsucHJpdmF0ZW1vZGUuYWkk"
     DEFAULT_MODEL: str = "glm-latest"
     SUPPORTED_MODELS: str = "deepseek-ocr-2,glm-5.3,glm-latest,glm-5.3-flash,glm-flash-latest,gpt-oss-120b,qwen3-embedding-4b,voxtral-mini-3b,whisper-large-v3"
-    MODEL_ALIASES_JSON: str = '{"glm-5":"glm-5.3","gpt-4o":"glm-latest","gpt-4":"glm-latest","gpt-3.5-turbo":"glm-flash-latest","claude-3-5-sonnet":"glm-latest"}'
+    MODEL_ALIASES_JSON: str = '{"glm-5":"glm-5.3"}'
 
     # Outlook Mail Service Configuration (Referencing genspark2api)
     OUTLOOK_ACCOUNT_FILE: str = "C:/Users/Administrator/PycharmProjects/genspark2api/OUT-20260728-S1000-00082_Filtered.txt"
